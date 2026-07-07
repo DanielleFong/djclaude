@@ -23,12 +23,13 @@ FRESH_LEVEL="${FRESH_LEVEL:-}"; OPUS_MODE="${OPUS_MODE:-}"
 [[ -f "$HOME/.config/djclaude/config" ]] && source "$HOME/.config/djclaude/config"
 FRESH_LEVEL="${FRESH_LEVEL:-bare}"; OPUS_MODE="${OPUS_MODE:-fit}"
 
-MODE=full; RESTART=0
+MODE=full; RESTART=0; QUARTET=0
 [[ "$(basename "$0")" == "djfreshclaude" ]] && MODE=fresh
 for a in "$@"; do case "$a" in
   --fresh)   MODE=fresh ;;
   --restart) RESTART=1 ;;
-  *) echo "usage: $(basename "$0") [--fresh] [--restart]" >&2; exit 1 ;;
+  --quartet) QUARTET=1 ;;
+  *) echo "usage: $(basename "$0") [--fresh] [--restart] [--quartet]" >&2; exit 1 ;;
 esac; done
 
 if [[ "$RESTART" == 0 ]] && tmux has-session -t $S 2>/dev/null; then
@@ -64,16 +65,22 @@ fi
 : > "$HERE/slack.md"
 tmux kill-session -t $S 2>/dev/null || true
 tmux new-session -d -s $S -x 220 -y 60 "$OPUS_CMD"
-tmux split-window -h -t $S:0.0 "$SONNET_CMD"
-tmux split-window -h -t $S:0.1 "tail -f $HERE/slack.md"
-tmux split-window -h -t $S:0.2 "codex -a never -s workspace-write -c model_reasoning_effort=none"   # GPT 5.5: auto-approve, sandboxed (not yolo)
-tmux split-window -h -t $S:0.3 "$FABLE_CMD"
+if [[ "$QUARTET" == 1 ]]; then
+  tmux split-window -h -t $S:0.0 "$SONNET_CMD"
+  tmux split-window -h -t $S:0.1 "tail -f $HERE/slack.md"
+  tmux split-window -h -t $S:0.2 "codex -a never -s workspace-write -c model_reasoning_effort=none"
+  tmux split-window -h -t $S:0.3 "$FABLE_CMD"
+  printf "{\"opus\":\"$S:0.0\",\"sonnet\":\"$S:0.1\",\"gpt\":\"$S:0.3\",\"fable\":\"$S:0.4\"}" > /tmp/dragons-layout.json
+else
+  tmux split-window -h -t $S:0.0 "$FABLE_CMD"
+  printf "{\"opus\":\"$S:0.0\",\"fable\":\"$S:0.1\"}" > /tmp/dragons-layout.json
+fi
 tmux select-layout -t $S:0 even-horizontal
 tmux split-window -v -f -l 5 -t $S:0 "cd $HERE && ./.venv/bin/python timeline.py"
 tmux set-option -t $S remain-on-exit on
 ( sleep 15
   tmux send-keys -t $S:0.0 "/config thinking=false" Enter   # opus: hard-off thinking
-  sleep 1; tmux send-keys -t $S:0.1 "/config thinking=false" Enter   # sonnet: hard-off
+  [[ "$QUARTET" == 1 ]] && { sleep 1; tmux send-keys -t $S:0.1 "/config thinking=false" Enter; }
   sleep 2; tmux send-keys -t $S:0.0 "/fast on" Enter   # CC 2.1.202+: direct syntax
 ) &
 pkill -f "$HERE/midi_daemon.py" 2>/dev/null || true

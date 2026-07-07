@@ -15,7 +15,10 @@ HERE = pathlib.Path(__file__).parent
 CFG = json.loads((HERE / 'mapping.json').read_text())
 STATE_FILE = pathlib.Path('/tmp/dragons-state.json')
 S = 'djclaude'
-PANES = {'opus': f'{S}:0.0', 'sonnet': f'{S}:0.1', 'gpt': f'{S}:0.3', 'fable': f'{S}:0.4'}
+try:
+    PANES = json.loads(pathlib.Path('/tmp/dragons-layout.json').read_text())
+except Exception:
+    PANES = {'opus': f'{S}:0.0', 'fable': f'{S}:0.1'}
 EFFORTS, GPT_EFFORTS = CFG['efforts'], CFG['gpt_efforts']
 OPUS_EFFORTS = ['nothink'] + EFFORTS   # 6 detents: thinking off, then low..max
 SETTLE = 0.3
@@ -32,6 +35,7 @@ def detent(v, levels): return min(len(levels)-1, v*len(levels)//128)
 def tmux(*args): subprocess.run(['tmux', *args], check=False)
 
 def send(head, level_idx):
+    if head not in PANES: return
     if head == 'gpt':
         eff = GPT_EFFORTS[level_idx]
         if state['sent'].get('gpt') == eff: return
@@ -116,7 +120,9 @@ def main():
                 x = state.get('crossfader', 64) / 127   # 0=left deck, 1=right deck
                 hb_phase += 1
                 left = (hb_phase % 4) / 4 >= x          # duty-cycle split
-                head = ('opus', 'sonnet')[hb_phase % 2] if left else ('gpt', 'fable')[hb_phase % 2]
+                L = [h for h in ('opus','sonnet') if h in PANES] or ['opus']
+                R = [h for h in ('gpt','fable') if h in PANES] or ['fable']
+                head = L[hb_phase % len(L)] if left else R[hb_phase % len(R)]
                 tmux('send-keys', '-t', PANES[head], HB_MSG, 'Enter')
                 if head == 'gpt':
                     time.sleep(0.8); tmux('send-keys', '-t', PANES['gpt'], 'Enter')

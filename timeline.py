@@ -6,10 +6,13 @@ import json, os, re, select, subprocess, sys, termios, time, tty, pathlib, threa
 S = 'djclaude'
 STATE = pathlib.Path('/tmp/dragons-state.json')
 LOG = pathlib.Path('/tmp/dragons-timeline.jsonl')
-HEADS = [('OPUS',  f'{S}:0.0', '\033[38;5;203m', 'opus'),
-         ('SONNET',f'{S}:0.1', '\033[38;5;44m',  'sonnet'),
-         ('GPT',   f'{S}:0.3', '\033[38;5;114m', 'gpt'),
-         ('FABLE', f'{S}:0.4', '\033[38;5;220m', 'fable')]
+try:
+    _LAY = json.loads(pathlib.Path('/tmp/dragons-layout.json').read_text())
+except Exception:
+    _LAY = {'opus': f'{S}:0.0', 'fable': f'{S}:0.1'}
+_ALL = [('OPUS','opus','\033[38;5;203m'), ('SONNET','sonnet','\033[38;5;44m'),
+        ('GPT','gpt','\033[38;5;114m'), ('FABLE','fable','\033[38;5;220m')]
+HEADS = [(n, _LAY[k], c, k) for n, k, c in _ALL if k in _LAY]
 DIM, RST, B = '\033[2m', '\033[0m', '\033[1m'
 series = {}   # t -> [act0..act3, spend0..spend3]
 events = []   # {'t','head','cost','total'} emitted at burst end
@@ -33,8 +36,8 @@ CLPROJ = pathlib.Path.home() / ".claude/projects/-Users-daniellefong-cc-rane-cla
 CODEX_S = pathlib.Path.home() / ".codex/sessions"
 PRICE = {"opus": (15, 75, 1.5, 18.75), "sonnet": (3, 15, 0.3, 3.75),
          "fable": (15, 75, 1.5, 18.75), "gpt": (1.25, 10, 0.125, 1.25)}  # ~$/Mtok in,out,cr,cw
-HKEYS = ("opus", "sonnet", "gpt", "fable")
-cum = {h: {"tok": 0.0, "usd": 0.0} for h in HKEYS}
+HKEYS = tuple(k for _,_,_,k in HEADS)
+cum = {h: {"tok": 0.0, "usd": 0.0} for h in ('opus','sonnet','gpt','fable')}
 _off = {}
 def ledger_tick():
     for f in CLPROJ.glob("*.jsonl"):
@@ -71,8 +74,9 @@ def ledger_tick():
     except Exception: pass
 
 def sampler():
-    prev = ['']*4
-    burst = [None]*4   # None or {'start_spend','acc','idle'}
+    N = len(HEADS)
+    prev = ['']*N
+    burst = [None]*N   # None or {'start_spend','acc','idle'}
     if LOG.exists():
         for ln in LOG.read_text().splitlines()[-3600:]:
             try: o = json.loads(ln); series[o['t']] = o['v']
@@ -85,7 +89,7 @@ def sampler():
             act = 0 if txt == prev[i] else sum(a!=b for a,b in zip(txt.ljust(4000), prev[i].ljust(4000)))
             prev[i] = txt; v.append(min(act, 2000))
             spends.append(None)  # ledger owns spend now
-        for i in range(4):
+        for i in range(N):
             act, sp = v[i], spends[i]
             b = burst[i]
             if act > ACT_T:

@@ -1,0 +1,6 @@
+.venv/
+*.log
+*.pid
+midi-log.txt
+slack.md
+__pycache__/

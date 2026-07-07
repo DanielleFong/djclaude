@@ -14,14 +14,14 @@
       "channel": 1,
       "cc": 28
     },
-    "left_pitch": {
-      "channel": 0,
-      "cc": 9,
-      "invert": true
-    },
     "crossfader": {
       "channel": 15,
       "cc": 8
+    },
+    "opus": {
+      "channel": 0,
+      "cc": 9,
+      "invert": true
     }
   },
   "efforts": [

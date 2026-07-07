@@ -35,24 +35,25 @@ if [[ "$RESTART" == 0 ]] && tmux has-session -t $S 2>/dev/null; then
   exec tmux attach -t $S
 fi
 
-CTX=(--append-system-prompt-file "$HERE/rig-context.md")
-Q=""; for a in "${CTX[@]}"; do Q+=" $(printf %q "$a")"; done
+QO=" --append-system-prompt-file $HERE/ctx-opus.md"
+QS=" --append-system-prompt-file $HERE/ctx-sonnet.md"
+QF=" --append-system-prompt-file $HERE/ctx-fable.md"
 SKIP="--dangerously-skip-permissions"
 THIN="--strict-mcp-config --mcp-config /opt/freshclaude/empty-mcp.json $SKIP"
 
 # Sub-billed heads (sonnet, fable): full vs fresh harness
 if [[ "$MODE" == fresh ]]; then
   case "$FRESH_LEVEL" in
-    bare) SONNET_CMD="EFFORT=low $DFC sub --model claude-sonnet-5$Q $THIN --append-system-prompt 'You are the SONNET head.'"
-          FABLE_CMD="$DFC sub --model 'claude-fable-5[1m]'$Q $THIN --append-system-prompt 'You are the FABLE head.'" ;;
+    bare) SONNET_CMD="EFFORT=low $DFC sub --model claude-sonnet-5$QS $THIN --append-system-prompt 'You are the SONNET head.'"
+          FABLE_CMD="$DFC sub --model 'claude-fable-5[1m]'$QF $THIN --append-system-prompt 'You are the FABLE head.'" ;;
     *) echo "djclaude: unknown FRESH_LEVEL '$FRESH_LEVEL' (known: bare)" >&2; exit 1 ;;
   esac
 else
-  SONNET_CMD="$CLAUDE --model claude-sonnet-5 --effort low$Q $SKIP --append-system-prompt 'You are the SONNET head.'"
-  FABLE_CMD="$CLAUDE --model 'claude-fable-5[1m]'$Q $SKIP --append-system-prompt 'You are the FABLE head.'"
+  SONNET_CMD="$CLAUDE --model claude-sonnet-5 --effort low$QS $SKIP --append-system-prompt 'You are the SONNET head.'"
+  FABLE_CMD="$CLAUDE --model 'claude-fable-5[1m]'$QF $SKIP --append-system-prompt 'You are the FABLE head.'"
 fi
 # Opus head: ALWAYS Dustin's key via dustinfreshclaude (never the sub)
-OPUS_CMD="EFFORT=low $DFC $OPUS_MODE$Q $SKIP --append-system-prompt 'You are the OPUS head.'"
+OPUS_CMD="EFFORT=low $DFC $OPUS_MODE$QO $SKIP --append-system-prompt 'You are the OPUS head.'"
 
 : # pre-flight: refresh sub OAuth token if expired (dustinfreshclaude sub fails closed)
 EXP=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["claudeAiOauth"].get("expiresAt",0))' 2>/dev/null || echo 0)
@@ -65,7 +66,7 @@ tmux kill-session -t $S 2>/dev/null || true
 tmux new-session -d -s $S -x 220 -y 60 "$OPUS_CMD"
 tmux split-window -h -t $S:0.0 "$SONNET_CMD"
 tmux split-window -h -t $S:0.1 "tail -f $HERE/slack.md"
-tmux split-window -h -t $S:0.2 "codex -c model_reasoning_effort=none"   # GPT 5.5 head, minimalist, no thinking
+tmux split-window -h -t $S:0.2 "codex -a never -s workspace-write -c model_reasoning_effort=none"   # GPT 5.5: auto-approve, sandboxed (not yolo)
 tmux split-window -h -t $S:0.3 "$FABLE_CMD"
 tmux select-layout -t $S:0 even-horizontal
 tmux split-window -v -f -l 5 -t $S:0 "cd $HERE && ./.venv/bin/python timeline.py"
@@ -73,8 +74,7 @@ tmux set-option -t $S remain-on-exit on
 ( sleep 15
   tmux send-keys -t $S:0.0 "/config thinking=false" Enter   # opus: hard-off thinking
   sleep 1; tmux send-keys -t $S:0.1 "/config thinking=false" Enter   # sonnet: hard-off
-  sleep 2; tmux send-keys -t $S:0.0 "/fast" Enter   # open fast-mode dialog...
-  sleep 3; tmux send-keys -t $S:0.0 Tab; sleep 1; tmux send-keys -t $S:0.0 Enter  # ...toggle ON
+  sleep 2; tmux send-keys -t $S:0.0 "/fast on" Enter   # CC 2.1.202+: direct syntax
 ) &
 pkill -f "$HERE/midi_daemon.py" 2>/dev/null || true
 "$HERE/.venv/bin/python" "$HERE/midi_daemon.py" > "$HERE/daemon.log" 2>&1 &

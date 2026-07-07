@@ -15,9 +15,12 @@ HERE = pathlib.Path(__file__).parent
 CFG = json.loads((HERE / 'mapping.json').read_text())
 STATE_FILE = pathlib.Path('/tmp/dragons-state.json')
 S = 'djclaude'
-PANES = {'sonnet': f'{S}:0.1', 'gpt': f'{S}:0.3', 'fable': f'{S}:0.4'}
+PANES = {'opus': f'{S}:0.0', 'sonnet': f'{S}:0.1', 'gpt': f'{S}:0.3', 'fable': f'{S}:0.4'}
 EFFORTS, GPT_EFFORTS = CFG['efforts'], CFG['gpt_efforts']
+OPUS_EFFORTS = ['nothink'] + EFFORTS   # 6 detents: thinking off, then low..max
 SETTLE = 0.3
+HB_PERIOD = 90   # seconds per heartbeat
+HB_MSG = 'hb: read slack.md; if you have an active task continue it, else assist another head. brief.'
 
 state = {n: 0 for n in CFG['controls']}
 state.update({'sent': {}})
@@ -36,7 +39,7 @@ def send(head, level_idx):
         if eff == 'none':
             # picker can't reach none: respawn pane, resume same thread at effort none
             tmux('respawn-pane', '-k', '-t', p,
-                 'codex resume --last -c model_reasoning_effort=none')
+                 'codex resume --last -a never -s workspace-write -c model_reasoning_effort=none')
         else:
             tmux('send-keys', '-t', p, 'Escape')            # close any open dialog
             time.sleep(0.3); tmux('send-keys', '-t', p, 'Escape')
@@ -45,6 +48,20 @@ def send(head, level_idx):
             time.sleep(1.2); tmux('send-keys', '-t', p, '1')  # explicit: 1 = gpt-5.5
             time.sleep(0.8); tmux('send-keys', '-t', p, str(level_idx))  # digit: low=1..xhigh=4
         state['sent']['gpt'] = eff
+    elif head == 'opus':
+        eff = OPUS_EFFORTS[level_idx]
+        prev = state['sent'].get('opus')
+        if prev == eff: return
+        p = PANES['opus']
+        if eff == 'nothink':
+            tmux('send-keys', '-t', p, '/config thinking=false', 'Enter')
+            time.sleep(0.8); tmux('send-keys', '-t', p, '/effort low', 'Enter')
+        else:
+            if prev in (None, 'nothink'):
+                tmux('send-keys', '-t', p, '/config thinking=true', 'Enter')
+                time.sleep(0.8)
+            tmux('send-keys', '-t', p, f'/effort {eff}', 'Enter')
+        state['sent']['opus'] = eff
     else:
         eff = EFFORTS[level_idx]
         if state['sent'].get(head) == eff: return
@@ -58,6 +75,7 @@ def main():
     ctl = {(c['channel'], c['cc']): (n, c.get('invert', False))
            for n, c in CFG['controls'].items()}
     pending = None
+    hb_last = time.time(); hb_phase = 0
     last_raw, jump_cand = {}, {}   # spurious-jump guard (Serato sync snaps pitch)
     with mido.open_input(CFG['port']) as port:
         print(f"listening on {CFG['port']}", flush=True)
@@ -87,10 +105,23 @@ def main():
                 pending = time.time(); write_state()
             if pending and time.time() - pending > SETTLE:
                 pending = None
+                send('opus', detent(state['opus'], OPUS_EFFORTS))
                 send('fable', detent(state['fable'], EFFORTS))
                 send('sonnet', detent(state['sonnet'], EFFORTS))
                 send('gpt', detent(state['gpt'], GPT_EFFORTS))
                 write_state()
+            now = time.time()
+            if now - hb_last > HB_PERIOD:
+                hb_last = now
+                x = state.get('crossfader', 64) / 127   # 0=left deck, 1=right deck
+                hb_phase += 1
+                left = (hb_phase % 4) / 4 >= x          # duty-cycle split
+                head = ('opus', 'sonnet')[hb_phase % 2] if left else ('gpt', 'fable')[hb_phase % 2]
+                tmux('send-keys', '-t', PANES[head], HB_MSG, 'Enter')
+                if head == 'gpt':
+                    time.sleep(0.8); tmux('send-keys', '-t', PANES['gpt'], 'Enter')
+                with open(HERE / 'slack.md', 'a') as f:
+                    f.write(f"[{time.strftime('%H:%M:%S')}] rig: ♥ heartbeat -> {head} (x={x:.2f})\n")
             time.sleep(0.01)
 
 if __name__ == '__main__':

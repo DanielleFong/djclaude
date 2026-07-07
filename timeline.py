@@ -6,7 +6,7 @@ import json, os, re, select, subprocess, sys, termios, time, tty, pathlib, threa
 S = 'djclaude'
 STATE = pathlib.Path('/tmp/dragons-state.json')
 LOG = pathlib.Path('/tmp/dragons-timeline.jsonl')
-HEADS = [('OPUS',  f'{S}:0.0', '\033[38;5;203m', None),
+HEADS = [('OPUS',  f'{S}:0.0', '\033[38;5;203m', 'opus'),
          ('SONNET',f'{S}:0.1', '\033[38;5;44m',  'sonnet'),
          ('GPT',   f'{S}:0.3', '\033[38;5;114m', 'gpt'),
          ('FABLE', f'{S}:0.4', '\033[38;5;220m', 'fable')]
@@ -19,12 +19,56 @@ ACT_T = 40    # activity threshold for burst detection
 UNIT = ['$', 'tok', 'ctx', 'tok']
 
 def kfmt(v):
+    if v >= 1e6: return f"{v/1e6:.1f}M"
     return f"{v/1000:.1f}k" if v >= 1000 else f"{v:.0f}"
 
 
 def pane(t):
     r = subprocess.run(['tmux','capture-pane','-p','-t',t], capture_output=True, text=True)
     return r.stdout if r.returncode == 0 else ''
+
+
+# --- cumulative token/dollar ledger from real transcripts ---
+CLPROJ = pathlib.Path.home() / ".claude/projects/-Users-daniellefong-cc-rane-claude"
+CODEX_S = pathlib.Path.home() / ".codex/sessions"
+PRICE = {"opus": (15, 75, 1.5, 18.75), "sonnet": (3, 15, 0.3, 3.75),
+         "fable": (15, 75, 1.5, 18.75), "gpt": (1.25, 10, 0.125, 1.25)}  # ~$/Mtok in,out,cr,cw
+HKEYS = ("opus", "sonnet", "gpt", "fable")
+cum = {h: {"tok": 0.0, "usd": 0.0} for h in HKEYS}
+_off = {}
+def ledger_tick():
+    for f in CLPROJ.glob("*.jsonl"):
+        try:
+            o0 = _off.get(f, 0); sz = f.stat().st_size
+            if sz <= o0: continue
+            with open(f) as fh:
+                fh.seek(o0)
+                for ln in fh:
+                    if '"usage"' not in ln: continue
+                    try: o = json.loads(ln)
+                    except Exception: continue
+                    msg = o.get("message") or {}
+                    model = msg.get("model") or ""
+                    h = next((x for x in ("opus","sonnet","fable") if x in model), None)
+                    u = msg.get("usage")
+                    if not h or not u: continue
+                    i, out = u.get("input_tokens",0), u.get("output_tokens",0)
+                    cr = u.get("cache_read_input_tokens",0); cw = u.get("cache_creation_input_tokens",0)
+                    pr = PRICE[h]
+                    cum[h]["tok"] += i+out+cr+cw
+                    cum[h]["usd"] += (i*pr[0] + out*pr[1] + cr*pr[2] + cw*pr[3]) / 1e6
+                _off[f] = fh.tell()
+        except Exception: pass
+    try:
+        f = max(CODEX_S.glob("*/*/*/*.jsonl"), key=lambda x: x.stat().st_mtime)
+        tail = f.read_bytes()[-8000:].decode("utf8","ignore")
+        m = re.findall(r'"total_token_usage":\{"input_tokens":(\d+),"cached_input_tokens":(\d+),"output_tokens":(\d+)', tail)
+        if m:
+            i, ci, out = map(int, m[-1])
+            pr = PRICE["gpt"]
+            cum["gpt"]["tok"] = i+out
+            cum["gpt"]["usd"] = ((i-ci)*pr[0] + ci*pr[2] + out*pr[1]) / 1e6
+    except Exception: pass
 
 def sampler():
     prev = ['']*4
@@ -40,30 +84,19 @@ def sampler():
             txt = pane(p)
             act = 0 if txt == prev[i] else sum(a!=b for a,b in zip(txt.ljust(4000), prev[i].ljust(4000)))
             prev[i] = txt; v.append(min(act, 2000))
-            sp = None
-            m = re.search(r'\$([\d.]+)k?/50k', txt)          # pylon (opus)
-            if m: sp = float(m.group(1))*1000
-            else:
-                m = re.search(r'([\d,]+) tokens', txt)        # cc token counter
-                if m: sp = float(m.group(1).replace(',',''))
-                else:
-                    m = re.search(r'Context (\d+)% left', txt) # codex burn-down
-                    if m: sp = (100-int(m.group(1)))*100
-            spends.append(sp)
+            spends.append(None)  # ledger owns spend now
         for i in range(4):
             act, sp = v[i], spends[i]
             b = burst[i]
             if act > ACT_T:
                 if b is None:
-                    burst[i] = {'start_spend': sp, 'acc': act, 'idle': 0}
+                    burst[i] = {'start_spend': cum[HKEYS[i]]['usd'], 'acc': act, 'idle': 0}
                 else:
                     b['acc'] += act; b['idle'] = 0
-                    if b['start_spend'] is None: b['start_spend'] = sp
             elif b is not None:
                 b['idle'] += 1
                 if b['idle'] >= 3 and b['acc'] > 300:   # burst over (ignore repaint blips)
-                    cost = (sp - b['start_spend']) if (sp is not None and b['start_spend'] is not None) else b['acc']
-                    cost = max(0, cost)
+                    cost = max(0.0, cum[HKEYS[i]]['usd'] - b['start_spend'])
                     with lock:
                         totals[i] += cost
                         events.append({'t': t, 'head': i, 'cost': cost, 'total': totals[i]})
@@ -71,12 +104,13 @@ def sampler():
         with lock:
             series[t] = v + spends
             with open(LOG,'a') as f: f.write(json.dumps({'t':t,'v':v+spends})+'\n')
+        ledger_tick()
         time.sleep(1.0)
 
 ZOOMS = [1,2,5,10,30,60]  # sec per column
 def render(w, zi, offset, follow):
     now = int(time.time()); z = ZOOMS[zi]
-    label_w = 16; cols = max(10, w - label_w - 12)
+    label_w = 16; cols = max(10, w - label_w - 22)
     end = now if follow else now - offset
     t0 = end - cols*z
     with lock: snap = dict(series)
@@ -90,22 +124,33 @@ def render(w, zi, offset, follow):
             vals = [snap[t][i] for t in range(lo,hi) if t in snap]
             buckets.append(sum(vals)/max(1,len(vals)) if vals else 0)
         mx = max(max(buckets), 50)
-        chars = [' ⣀⣤⣶⣿'[min(4,round(b/mx*4))] for b in buckets]
+        # DSD/tape-style density coding: dots-per-cell ~ level, dithered
+        DITHER = (16, 4, 64, 8, 128, 2, 32, 1)   # spread-out braille bit order
+        chars = []
+        for ci, b in enumerate(buckets):
+            k = min(8, round(b / mx * 8))
+            rot = (ci * 3) % 8                     # per-column rotation -> texture
+            dots = 0
+            for j in range(k): dots |= DITHER[(rot + j) % 8]
+            chars.append(chr(0x2800 + dots))
         with lock: evs = [e for e in events if e['head'] == i and t0 <= e['t'] <= end]
-        used = -99
-        for e in sorted(evs, key=lambda e: e['t']):
+        if evs:                                    # only the latest burst labelled
+            e = max(evs, key=lambda e: e['t'])
             col = (e['t'] - t0) // z + 1
-            if col <= used + 1: continue   # skip overlapping labels
-            u = UNIT[i]
-            lab = f"{u}{kfmt(e['cost'])}/{kfmt(e['total'])}"
+            lab = f"${e['cost']:.2f}/${e['total']:.2f}"
             for j, ch in enumerate(lab):
                 if 0 <= col+j < len(chars): chars[col+j] = ch
-            used = col + len(lab)
+        if not follow:                              # scrub cursor readout
+            cur_col = cols - 1
+            vals = [snap[t][i] for t in range(end-z, end) if t in snap]
+            lab = f"◀{kfmt(sum(vals)/max(1,len(vals)))}"
+            for j, ch in enumerate(lab):
+                if 0 <= cur_col-len(lab)+j < len(chars): chars[cur_col-len(lab)+j] = ch
         spark = c + ''.join(chars) + RST
-        eff = (sent.get(key) or ('⚡' if key is None else '·'))[:7]
-        cur = [snap[t][4+i] for t in sorted(snap) if snap[t][4+i] is not None][-1:] 
-        curs = f"{cur[0]:,.0f}" if cur else '·'
-        out.append(f"\033[K{c}{B}{name:<7}{RST}{DIM}{eff:<8}{RST}{spark} {DIM}{curs:>8}{RST}")
+        eff = ('⚡' if i == 0 else '') + (sent.get(key) or '·')[:6]
+        c_ = cum[HKEYS[i]]
+        curs = f"{kfmt(c_['tok'])}t ~${c_['usd']:,.2f}"
+        out.append(f"\033[K{c}{B}{name:<7}{RST}{DIM}{eff:<8}{RST}{spark} {DIM}{curs:>16}{RST}")
     span = cols*z
     mode = 'LIVE' if follow else f'-{offset}s'
     legend = f" {z}s/col {span//60}m{span%60:02d}s {mode}"

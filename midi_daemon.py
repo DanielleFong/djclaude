@@ -102,7 +102,7 @@ WHEEL_UP  = ['1b','5b','3c','36','34','3b','31','30','3b','31','30','4d']   # ES
 WHEEL_DN  = ['1b','5b','3c','36','35','3b','31','30','3b','31','30','4d']   # ESC[<65;10;10M
 def wheel(pane, n):
     seq = WHEEL_DN if n > 0 else WHEEL_UP
-    for _ in range(min(6, abs(n))):
+    for _ in range(min(48, abs(n))):     # pipe sends are 0.5µs; let big swipes through
         tmux('send-keys', '-t', pane, '-H', *seq)
 
 def tmux(*args):
@@ -171,12 +171,24 @@ def main():
     jog_last, jog_acc, strip_last = {}, {}, {}
     jog_tick_t, jog_run_start = {}, {}
     play_dir, play_until, play_beat = {}, {}, {}
-    auto_scrub = {}; scrub_t = 0
+    auto_scrub = {}; scrub_t = 0; strip_touch_t = {}; strip_pending = {}; strip_acc = {}; last_input_t = {}
     q = collections.deque()
-    with mido.open_input(CFG['port'], callback=q.append) as port:
-        print(f"listening on {CFG['port']} (event-driven, 240Hz loop)", flush=True)
-        write_state()
+    port = mido.open_input(CFG['port'], callback=q.append)
+    print(f"listening on {CFG['port']} (event-driven, 240Hz loop)", flush=True)
+    write_state()
+    last_evt = time.time(); reopen_t = 0
+    if True:
         while True:
+            # self-heal: if silent >20s, try reopening the port (device re-enumeration)
+            if q: last_evt = time.time()
+            if time.time() - last_evt > 20 and time.time() - reopen_t > 20:
+                reopen_t = time.time()
+                try:
+                    port.close()
+                    port = mido.open_input(CFG['port'], callback=q.append)
+                    print(f"[{time.strftime('%H:%M:%S')}] reopened MIDI port", flush=True)
+                except Exception as e:
+                    print(f"[{time.strftime('%H:%M:%S')}] reopen failed: {e}", flush=True)
             moved = False
             while q:
                 m = q.popleft()
@@ -192,6 +204,8 @@ def main():
                         jog_last[name] = m.value
                         if last is None: continue
                         d = (m.value - last + 64) % 128 - 64   # wrapped delta
+                        auto_scrub[name.split('_')[1]] = 0      # platter takes over
+                        last_input_t[name.split('_')[1]] = time.time()
                         jog_acc[name] = jog_acc.get(name, 0.0) + d
                         now_t = time.time()
                         if now_t - jog_tick_t.get(name, 0) > 0.3:
@@ -210,37 +224,15 @@ def main():
                             jog_acc[name] -= n * NOTCH
                             k = 'needle_' + head
                             pos = state.get(k, 127)
-                            if n < 0 and pos <= 0:
-                                state['tape_off'] = state.get('tape_off', 0) + abs(n) * 15  # scrub tape back
-                            elif n > 0 and state.get('tape_off', 0) > 0:
-                                state['tape_off'] = max(0, state['tape_off'] - n * 15)      # unwind toward live
+                            if (n < 0 and pos <= 0) or (n > 0 and pos >= 127):
+                                jog_acc[name] = 0.0             # at the wall: locked, no debt
                             else:
                                 state[k] = max(0, min(127, pos + n * 6))
-                            write_state()
+                                write_state()
                             wheel(PANES[head], n)   # 3-line wheel notches: smooth
                     continue
                 if mode == 'strip':
-                    head = name.split('_')[1]
-                    if head in PANES:
-                        state['needle_' + head] = m.value; write_state()
-                        auto_scrub[head] = 0
-                        if m.value >= 120:
-                            state['needle_' + head] = 127
-                            state['tape_off'] = 0
-                            tmux('send-keys', '-t', PANES[head], 'C-End')    # live
-                        elif m.value <= 6:
-                            state['needle_' + head] = 0
-                            tmux('send-keys', '-t', PANES[head], 'C-Home')   # top
-                        elif m.value >= 108:
-                            auto_scrub[head] = 1    # push past the edge: auto-scrub fwd
-                        elif m.value <= 19:
-                            auto_scrub[head] = -1   # auto-scrub back
-                        else:
-                            last = strip_last.get(name, m.value)
-                            strip_last[name] = m.value
-                            steps = (m.value - last) // 8
-                            for _ in range(min(6, abs(steps))):
-                                tmux('send-keys', '-t', PANES[head], 'NPage' if steps > 0 else 'PPage')
+                    strip_pending[name] = m.value   # coalesce: only newest position acts
                     continue
                 raw = m.value
                 lr = last_raw.get(name)
@@ -255,6 +247,40 @@ def main():
                 v = 127 - raw if inv else raw
                 if state.get(name) != v:
                     state[name] = v; moved = True
+            for name, val in list(strip_pending.items()):
+                del strip_pending[name]
+                head = name.split('_')[1]
+                if head not in PANES: continue
+                auto_scrub[head] = 0
+                strip_touch_t[head] = time.time()
+                last_input_t[head] = time.time()
+                if val >= 120:
+                    state['needle_' + head] = 127; state['tape_off'] = 0
+                    tmux('send-keys', '-t', PANES[head], 'C-End')
+                elif val <= 6:
+                    state['needle_' + head] = 0
+                    tmux('send-keys', '-t', PANES[head], 'C-Home')
+                elif val >= 108:
+                    state['needle_' + head] = val; auto_scrub[head] = 1
+                elif val <= 19:
+                    state['needle_' + head] = val; auto_scrub[head] = -1
+                else:
+                    last = strip_last.get(name, val)
+                    acc = strip_acc.get(name, 0.0) + (val - last) / 2.0   # keep fractional motion
+                    strip_last[name] = val
+                    notches = int(acc)
+                    strip_acc[name] = acc - notches
+                    at_top = state.get('needle_' + head, 127) <= 0
+                    if notches < 0 and at_top:
+                        # cursor at the wall, still dragging left: scrub the tape back
+                        state['tape_off'] = min(3600, state.get('tape_off', 0) + abs(notches) * 20)
+                    elif notches > 0 and state.get('tape_off', 0) > 0:
+                        # dragging right with tape wound back: unwind toward live 1:1
+                        state['tape_off'] = max(0, state['tape_off'] - notches * 20)
+                    else:
+                        state['needle_' + head] = val
+                        if notches: wheel(PANES[head], notches)
+                write_state()
             if moved:
                 pending = time.time(); write_state()
             _now = time.time()
@@ -264,15 +290,27 @@ def main():
                     play_beat[nm] = _now
                     h = nm.split('_')[1]
                     if h in PANES: wheel(PANES[h], play_dir.get(nm, 1))
+            _fnow = time.time()
+            for h in list(last_input_t):
+                if _fnow - last_input_t[h] < 1.0:
+                    ndl = state.get('needle_' + h, 127)
+                    if ndl <= 2:                                    # pinned left: tape follows
+                        state['tape_off'] = min(3600, state.get('tape_off', 0) + 10)
+                        write_state()
+                    elif ndl >= 125 and state.get('tape_off', 0) > 0:  # pinned right: reel to live
+                        state['tape_off'] = max(0, state['tape_off'] - 30)
+                        write_state()
             if time.time() - scrub_t > 0.7:
                 scrub_t = time.time()
                 for h, d in list(auto_scrub.items()):
+                    if d and time.time() - strip_touch_t.get(h, 0) > 2.5:
+                        auto_scrub[h] = 0; continue             # finger gone: stop
                     if d and h in PANES:
                         wheel(PANES[h], d * 2)   # readable auto-crawl: 6 lines per beat
                         k = 'needle_' + h
                         pos = state.get(k, 64)
                         if d < 0 and pos <= 0:
-                            state['tape_off'] = state.get('tape_off', 0) + 45   # tape scrub back
+                            state['tape_off'] = min(3600, state.get('tape_off', 0) + 45)  # capped tape scrub
                         elif d > 0 and state.get('tape_off', 0) > 0:
                             state['tape_off'] = max(0, state['tape_off'] - 45)
                         else:

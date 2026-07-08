@@ -176,8 +176,15 @@ def render(w, zi, offset, follow):
                 if 0 <= cur_col-len(lab)+j < len(chars): chars[cur_col-len(lab)+j] = ch
         ndl = s_needle(key)
         if ndl is not None:
-            ncol = min(len(chars)-1, int(ndl/127 * (len(chars)-1)))
-            chars[ncol] = '\033[38;5;208m┃' + c   # orange needle
+            ORANGE = '\033[38;5;208m'
+            scrubbed = not follow                      # tape wound into the past
+            if scrubbed and ndl >= 126:
+                chars[-1] = ORANGE + '▶' + c           # live position: off-screen right
+            elif ndl <= 1:
+                chars[0] = ORANGE + '◀' + c            # transcript start: beyond frame left
+            else:
+                ncol = min(len(chars)-1, int(ndl/127 * (len(chars)-1)))
+                chars[ncol] = ORANGE + '┃' + c         # orange needle in frame
         spark = c + ''.join(chars) + RST
         tgt = target(key)
         now_ = time.time()

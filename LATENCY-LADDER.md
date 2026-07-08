@@ -9,3 +9,14 @@
 | tmux escape-time | 500 ms | 0 | Esc handled instantly |
 | remaining gates | | | tmux server cmd handling ~0.3ms · CC page repaint · Ghostty vsync (4.2/5.7ms frame) |
 | unfixable | | | CC transcript scrolls page-wise; no line/pixel API |
+
+## model-side, measured 2026-07-07 (single runs, 400-token generations)
+| head·effort | ttft | gen tok/s | note |
+|---|---|---|---|
+| opus-4.8 | 0.96s | 47 | fast mode is harness-level; `speed` param rejected by API |
+| fable low | 3.7s | 46 | ttft = adaptive thinking time |
+| fable medium | 3.8s | 51 | |
+| fable high | 4.1s | 42 | |
+| fable xhigh | 5.1s | 62 | |
+| fable max | 9.4s | ~42 effective | output arrives as post-think burst |
+**finding: the effort fader buys THINKING TIME (ttft 3.7→9.4s), not typing speed (~45-60 tok/s flat).**

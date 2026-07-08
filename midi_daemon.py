@@ -170,6 +170,7 @@ def main():
     last_raw, jump_cand = {}, {}
     jog_last, jog_acc, strip_last = {}, {}, {}
     jog_tick_t, jog_run_start = {}, {}
+    jog_gest = {}
     play_dir, play_until, play_beat = {}, {}, {}
     auto_scrub = {}; scrub_t = 0; strip_touch_t = {}; strip_pending = {}; strip_acc = {}; last_input_t = {}
     q = collections.deque()
@@ -204,6 +205,24 @@ def main():
                         jog_last[name] = m.value
                         if last is None: continue
                         d = (m.value - last + 64) % 128 - 64   # wrapped delta
+                        # rebound deadband: platters physically settle back a few ticks
+                        # after a spin — swallow small reversals right after motion stops
+                        now_r = time.time()
+                        g = jog_gest.setdefault(name, {'dir': 0, 'run': 0, 't': 0, 'debt': 0})
+                        if d != 0:
+                            dr = 1 if d > 0 else -1
+                            if dr == g['dir']:
+                                g['run'] += abs(d); g['debt'] = 0
+                            else:
+                                budget = 4 if g['run'] < 300 else 60   # hand wobble vs motor braking
+                                window = 0.35 if g['run'] < 300 else 0.8
+                                if g['run'] >= 8 and now_r - g['t'] < window:
+                                    g['debt'] += abs(d)
+                                    if g['debt'] <= budget:
+                                        g['t'] = now_r
+                                        continue          # swallowed rebound/braking
+                                g['dir'], g['run'], g['debt'] = dr, abs(d), 0
+                            g['t'] = now_r
                         auto_scrub[name.split('_')[1]] = 0      # platter takes over
                         last_input_t[name.split('_')[1]] = time.time()
                         jog_acc[name] = jog_acc.get(name, 0.0) + d

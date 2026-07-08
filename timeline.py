@@ -37,6 +37,7 @@ CODEX_S = pathlib.Path.home() / ".codex/sessions"
 PRICE = {"opus": (15, 75, 1.5, 18.75), "sonnet": (3, 15, 0.3, 3.75),
          "fable": (15, 75, 1.5, 18.75), "gpt": (1.25, 10, 0.125, 1.25)}  # ~$/Mtok in,out,cr,cw
 HKEYS = tuple(k for _,_,_,k in HEADS)
+last_txt = {}
 cum = {h: {"tok": 0.0, "usd": 0.0} for h in ('opus','sonnet','gpt','fable')}
 _off = {}
 def ledger_tick():
@@ -59,6 +60,9 @@ def ledger_tick():
                     cr = u.get("cache_read_input_tokens",0); cw = u.get("cache_creation_input_tokens",0)
                     pr = PRICE[h]
                     cum[h]["tok"] += i+out+cr+cw
+                    for blk in (msg.get("content") or []):
+                        if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text","").strip():
+                            last_txt[h] = blk["text"].strip().split("\n")[0][:100]
                     cum[h]["usd"] += (i*pr[0] + out*pr[1] + cr*pr[2] + cw*pr[3]) / 1e6
                 _off[f] = fh.tell()
         except Exception: pass
@@ -104,6 +108,12 @@ def sampler():
                     with lock:
                         totals[i] += cost
                         events.append({'t': t, 'head': i, 'cost': cost, 'total': totals[i]})
+                    try:
+                        hk = HKEYS[i]
+                        snip = last_txt.get(hk, '')
+                        with open(pathlib.Path(__file__).parent / 'slack.md', 'a') as f:
+                            f.write(f"[{time.strftime('%H:%M:%S')}] rig: {hk.upper()} burst ~${cost:.2f} — {snip}\n")
+                    except Exception: pass
                     burst[i] = None
         with lock:
             series[t] = v + spends
@@ -112,15 +122,29 @@ def sampler():
         time.sleep(1.0)
 
 ZOOMS = [1,2,5,10,30,60]  # sec per column
+_prev_sent = {}
+_lock_until = {}
+CHARGE = ['⡀','⡄','⡆','⡇','⣇','⣧','⣷','⣿']
 def render(w, zi, offset, follow):
     now = int(time.time()); z = ZOOMS[zi]
     label_w = 16; cols = max(10, w - label_w - 22)
     end = now if follow else now - offset
     t0 = end - cols*z
     with lock: snap = dict(series)
-    try: sent = json.loads(STATE.read_text()).get('sent', {})
-    except Exception: sent = {}
-    out = ['\033[H']
+    try: st_ = json.loads(STATE.read_text())
+    except Exception: st_ = {}
+    sent = st_.get('sent', {})
+    def s_needle(k): return st_.get('needle_' + k) if k in ('opus','fable') else None
+    EFF5 = ["low","medium","high","xhigh","max"]
+    EFF6 = ["nothink"] + EFF5
+    GEFF = ["none","low","medium","high","xhigh"]
+    def target(k):
+        v = st_.get(k)
+        if v is None: return None
+        lv = EFF6 if k == 'opus' else (GEFF if k == 'gpt' else EFF5)
+        return lv[min(len(lv)-1, v*len(lv)//128)]
+    # periodic full clear to purge stray output/scroll residue
+    out = ['\033[2J\033[H' if int(time.time()) % 5 == 0 else '\033[H']
     for i,(name, _, c, key) in enumerate(HEADS):
         buckets = []
         for ci in range(cols):
@@ -133,7 +157,7 @@ def render(w, zi, offset, follow):
         chars = []
         for ci, b in enumerate(buckets):
             k = min(8, round(b / mx * 8))
-            rot = (ci * 3) % 8                     # per-column rotation -> texture
+            rot = ((t0 + ci * z) // z * 3) % 8     # anchored to absolute time: stable under panning
             dots = 0
             for j in range(k): dots |= DITHER[(rot + j) % 8]
             chars.append(chr(0x2800 + dots))
@@ -150,16 +174,46 @@ def render(w, zi, offset, follow):
             lab = f"◀{kfmt(sum(vals)/max(1,len(vals)))}"
             for j, ch in enumerate(lab):
                 if 0 <= cur_col-len(lab)+j < len(chars): chars[cur_col-len(lab)+j] = ch
+        ndl = s_needle(key)
+        if ndl is not None:
+            ncol = min(len(chars)-1, int(ndl/127 * (len(chars)-1)))
+            chars[ncol] = '\033[38;5;208m┃' + c   # orange needle
         spark = c + ''.join(chars) + RST
-        eff = ('⚡' if i == 0 else '') + (sent.get(key) or '·')[:6]
+        tgt = target(key)
+        now_ = time.time()
+        sv = sent.get(key)
+        if _prev_sent.get(key) != sv and sv is not None:
+            if _prev_sent.get(key) is not None: _lock_until[key] = now_ + 1.2
+            _prev_sent[key] = sv
+        fast = '⚡' if i == 0 else ''
+        if tgt and tgt != sv:                      # CHARGING: pulse toward target
+            ph = int(now_ * 10)
+            bar = ''.join(CHARGE[(ph + j) % 8] for j in range(3))
+            eff = f"{fast}\033[5m{bar}\033[25m{tgt[:4]}"
+        elif now_ < _lock_until.get(key, 0):       # LOCK IN: inverse flash
+            eff = f"{fast}\033[7m⟦{(sv or '')[:5].upper()}⟧\033[27m"
+        else:
+            eff = fast + (sv or '·')[:6]
         c_ = cum[HKEYS[i]]
         curs = f"{kfmt(c_['tok'])}t ~${c_['usd']:,.2f}"
         out.append(f"\033[K{c}{B}{name:<7}{RST}{DIM}{eff:<8}{RST}{spark} {DIM}{curs:>16}{RST}")
     span = cols*z
     mode = 'LIVE' if follow else f'-{offset}s'
-    legend = f" {z}s/col {span//60}m{span%60:02d}s {mode}"
-    axis = f"├{'─'*max(0,cols-2-len(legend))}{legend}┤"
-    out.append(f"\033[K{DIM}{'':<{label_w}}{axis}{RST}")
+    legend = f" {z}s/col {mode}"
+    axis = list('─' * cols)
+    step = max(1, cols // 5)                       # ~5 time ticks
+    for ci in range(0, cols - 8, step):
+        tt = t0 + ci * z
+        lt = time.localtime(tt)
+        today = time.localtime()
+        fmt = '%H:%M:%S' if (lt.tm_yday == today.tm_yday and lt.tm_year == today.tm_year) else '%m-%d %H:%M'
+        lab = '┴' + time.strftime(fmt, lt)
+        for j, ch in enumerate(lab):
+            if ci + j < cols: axis[ci + j] = ch
+    for j, ch in enumerate(legend):
+        p = cols - len(legend) + j
+        if 0 <= p < cols: axis[p] = ch
+    out.append(f"\033[K{DIM}{'':<{label_w}}├{''.join(axis)}┤{RST}")
     sys.stdout.write('\n'.join(out) + '\033[J'); sys.stdout.flush()
 
 def main():
@@ -176,12 +230,17 @@ def main():
              '  rig: djclaude --restart = rebuild · faders: Lvol=sonnet Rvol=gpt Rpitch=fable']
     try:
         while True:
+            try: _tape = json.loads(STATE.read_text()).get('tape_off')
+            except Exception: _tape = None
+            if _tape is not None and _tape != getattr(main, '_last_tape', None):
+                main._last_tape = _tape
+                offset, follow = (_tape, False) if _tape > 0 else (0, True)
             w = os.get_terminal_size().columns
             render(w, zi, offset, follow)
             if cheat:
                 sys.stdout.write('\n' + '\n'.join(f'\033[K\033[38;5;110m{l}\033[0m' for l in CHEAT))
                 sys.stdout.flush()
-            r,_,_ = select.select([fd],[],[],1/30)
+            r,_,_ = select.select([fd],[],[],1/240)
             if not r: continue
             data = os.read(fd, 64).decode('latin1')
             for m in re.finditer(r'\x1b\[<(\d+);\d+;\d+[Mm]', data):
@@ -200,7 +259,6 @@ def main():
                 cheat = not cheat
                 subprocess.run(['tmux','resize-pane','-t',f'{S}:0.5','-y',str(10 if cheat else 5)], check=False)
             if 'e' in data or '\x1b[F' in data: offset, follow = 0, True
-            if 'q' in data: break
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         sys.stdout.write('\033[?1000l\033[?1006l\033[?25h')

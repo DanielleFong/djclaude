@@ -45,13 +45,13 @@ THIN="--strict-mcp-config --mcp-config /opt/freshclaude/empty-mcp.json $SKIP"
 # Sub-billed heads (sonnet, fable): full vs fresh harness
 if [[ "$MODE" == fresh ]]; then
   case "$FRESH_LEVEL" in
-    bare) SONNET_CMD="EFFORT=low $DFC sub --model claude-sonnet-5$QS $THIN --append-system-prompt 'You are the SONNET head.'"
-          FABLE_CMD="$DFC sub --model 'claude-fable-5[1m]'$QF $THIN --append-system-prompt 'You are the FABLE head.'" ;;
+    bare) SONNET_CMD="env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN $CLAUDE --model claude-sonnet-5 --effort low$QS $THIN"
+          FABLE_CMD="env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN $CLAUDE --model 'claude-fable-5[1m]'$QF $THIN" ;;
     *) echo "djclaude: unknown FRESH_LEVEL '$FRESH_LEVEL' (known: bare)" >&2; exit 1 ;;
   esac
 else
-  SONNET_CMD="$CLAUDE --model claude-sonnet-5 --effort low$QS $SKIP --append-system-prompt 'You are the SONNET head.'"
-  FABLE_CMD="$CLAUDE --model 'claude-fable-5[1m]'$QF $SKIP --append-system-prompt 'You are the FABLE head.'"
+  SONNET_CMD="$CLAUDE --model claude-sonnet-5 --effort low$QS $SKIP"
+  FABLE_CMD="$CLAUDE --model 'claude-fable-5[1m]'$QF $SKIP"
 fi
 # Opus head: ALWAYS Dustin's key via dustinfreshclaude (never the sub)
 OPUS_CMD="EFFORT=low $DFC $OPUS_MODE$QO $SKIP --append-system-prompt 'You are the OPUS head.'"

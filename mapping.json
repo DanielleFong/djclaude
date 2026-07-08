@@ -22,6 +22,26 @@
       "channel": 0,
       "cc": 9,
       "invert": true
+    },
+    "jog_opus": {
+      "channel": 0,
+      "cc": 6,
+      "mode": "jog"
+    },
+    "jog_fable": {
+      "channel": 1,
+      "cc": 6,
+      "mode": "jog"
+    },
+    "strip_opus": {
+      "channel": 0,
+      "cc": 43,
+      "mode": "strip"
+    },
+    "strip_fable": {
+      "channel": 1,
+      "cc": 43,
+      "mode": "strip"
     }
   },
   "efforts": [

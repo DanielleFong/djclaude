@@ -6,7 +6,64 @@
   left pitch, crossfader               -> display only (phase 2)
 State -> /tmp/dragons-state.json for statusbar.py.
 """
-import json, time, subprocess, pathlib
+import json, time, subprocess, pathlib, threading, collections
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+TUNE_FILE = pathlib.Path('/tmp/dragons-tuning.json')
+def tune():
+    try: return json.loads(TUNE_FILE.read_text())
+    except Exception: return {"notch": 1, "play_ignore": 1}
+
+TUNE_HTML = b'''<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<body style="background:#0d0d10;color:#ddd;font-family:ui-monospace,monospace;max-width:480px;margin:40px auto;padding:0 20px">
+<h2 style="color:#ffd75f">djclaude platter tuning</h2>
+<label>NOTCH (platter ticks per 3-line step): <b id=nv></b></label><br>
+<input id=n type=range min=1 max=400 style="width:100%%"><br><br>
+<label><input id=p type=checkbox> ignore motor/play rotation (scratch-only)</label>
+<p id=st style="color:#666"></p>
+<script>
+const n=document.getElementById('n'),p=document.getElementById('p'),nv=document.getElementById('nv'),st=document.getElementById('st');
+fetch('/tune.json').then(r=>r.json()).then(t=>{n.value=t.notch;nv.textContent=t.notch;p.checked=!!t.play_ignore});
+function push(){nv.textContent=n.value;fetch('/set?notch='+n.value+'&play_ignore='+(p.checked?1:0)).then(()=>st.textContent='applied '+new Date().toLocaleTimeString())}
+n.oninput=push; p.onchange=push;
+</script>'''
+
+class _EffortHTTP(BaseHTTPRequestHandler):
+    def do_GET(self):
+        from urllib.parse import urlparse, parse_qs
+        u = urlparse(self.path)
+        if u.path == '/tune':
+            self.send_response(200); self.send_header('content-type','text/html; charset=utf-8'); self.end_headers()
+            self.wfile.write(TUNE_HTML); return
+        if u.path == '/tune.json':
+            self.send_response(200); self.send_header('content-type','application/json'); self.end_headers()
+            self.wfile.write(json.dumps(tune()).encode()); return
+        if u.path == '/set':
+            q = parse_qs(u.query)
+            t = tune()
+            if 'notch' in q: t['notch'] = max(1, min(400, int(q['notch'][0])))
+            if 'play_ignore' in q: t['play_ignore'] = int(q['play_ignore'][0])
+            TUNE_FILE.write_text(json.dumps(t))
+            self.send_response(200); self.end_headers(); return
+        return self._effort()
+    def _effort(self):
+        try: st = json.loads(pathlib.Path('/tmp/dragons-state.json').read_text())
+        except Exception: st = {}
+        # claude.ai effort follows the fable fader (right pitch)
+        lv = ['low','medium','high','xhigh','max']
+        v = st.get('fable', 0)
+        eff = lv[min(4, v*5//128)]
+        body = json.dumps({'effort': eff}).encode()
+        self.send_response(200)
+        self.send_header('content-type', 'application/json')
+        self.send_header('access-control-allow-origin', 'https://claude.ai')
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+
+def _serve():
+    HTTPServer(('127.0.0.1', 7683), _EffortHTTP).serve_forever()
+threading.Thread(target=_serve, daemon=True).start()
 
 import mido
 mido.set_backend('mido.backends.rtmidi')
@@ -21,9 +78,7 @@ except Exception:
     PANES = {'opus': f'{S}:0.0', 'fable': f'{S}:0.1'}
 EFFORTS, GPT_EFFORTS = CFG['efforts'], CFG['gpt_efforts']
 OPUS_EFFORTS = ['nothink'] + EFFORTS   # 6 detents: thinking off, then low..max
-SETTLE = 0.3
-HB_PERIOD = 90   # seconds per heartbeat
-HB_MSG = 'hb: read slack.md; if you have an active task continue it, else assist another head. brief.'
+SETTLE = 1.5  # relaxation: fader must rest this long before send
 
 state = {n: 0 for n in CFG['controls']}
 state.update({'sent': {}})
@@ -32,7 +87,30 @@ def write_state(): STATE_FILE.write_text(json.dumps(state))
 
 def detent(v, levels): return min(len(levels)-1, v*len(levels)//128)
 
-def tmux(*args): subprocess.run(['tmux', *args], check=False)
+_tmux_pipe = None
+def _pipe():
+    global _tmux_pipe
+    if _tmux_pipe is None or _tmux_pipe.poll() is not None:
+        _tmux_pipe = subprocess.Popen(['tmux', '-C', 'attach-session', '-t', S],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+    return _tmux_pipe
+
+def _q(a):
+    return "'" + str(a).replace("'", "'\\''") + "'"
+
+WHEEL_UP  = ['1b','5b','3c','36','34','3b','31','30','3b','31','30','4d']   # ESC[<64;10;10M
+WHEEL_DN  = ['1b','5b','3c','36','35','3b','31','30','3b','31','30','4d']   # ESC[<65;10;10M
+def wheel(pane, n):
+    seq = WHEEL_DN if n > 0 else WHEEL_UP
+    for _ in range(min(6, abs(n))):
+        tmux('send-keys', '-t', pane, '-H', *seq)
+
+def tmux(*args):
+    try:
+        p = _pipe()
+        p.stdin.write(' '.join(_q(a) for a in args) + '\n'); p.stdin.flush()
+    except Exception:
+        subprocess.run(['tmux', *args], check=False)   # fallback
 
 def send(head, level_idx):
     if head not in PANES: return
@@ -75,27 +153,99 @@ def send(head, level_idx):
     with open(HERE / 'slack.md', 'a') as f:
         f.write(f"[{time.strftime('%H:%M:%S')}] rig: {head} effort -> {eff}\n")
 
+def _reap_orphan_pipes():
+    # control-mode clients from dead daemons distort sizing; reap any tmux -C with ppid 1
+    try:
+        out = subprocess.run(['pgrep', '-f', 'tmux -C attach'], capture_output=True, text=True).stdout
+        for pid in out.split():
+            pp = subprocess.run(['ps', '-o', 'ppid=', '-p', pid], capture_output=True, text=True).stdout.strip()
+            if pp == '1': subprocess.run(['kill', pid])
+    except Exception: pass
+
 def main():
+    _reap_orphan_pipes()
     ctl = {(c['channel'], c['cc']): (n, c.get('invert', False))
            for n, c in CFG['controls'].items()}
     pending = None
-    hb_last = time.time(); hb_phase = 0
-    last_raw, jump_cand = {}, {}   # spurious-jump guard (Serato sync snaps pitch)
-    with mido.open_input(CFG['port']) as port:
-        print(f"listening on {CFG['port']}", flush=True)
+    last_raw, jump_cand = {}, {}
+    jog_last, jog_acc, strip_last = {}, {}, {}
+    jog_tick_t, jog_run_start = {}, {}
+    play_dir, play_until, play_beat = {}, {}, {}
+    auto_scrub = {}; scrub_t = 0
+    q = collections.deque()
+    with mido.open_input(CFG['port'], callback=q.append) as port:
+        print(f"listening on {CFG['port']} (event-driven, 240Hz loop)", flush=True)
         write_state()
         while True:
             moved = False
-            for m in port.iter_pending():
+            while q:
+                m = q.popleft()
                 if m.type != 'control_change': continue
                 nc = ctl.get((m.channel, m.control))
                 if not nc: continue
                 name, inv = nc
+                mode = CFG['controls'][name].get('mode')
+                if mode == 'jog':
+                    head = name.split('_')[1]
+                    if head in PANES:
+                        last = jog_last.get(name)
+                        jog_last[name] = m.value
+                        if last is None: continue
+                        d = (m.value - last + 64) % 128 - 64   # wrapped delta
+                        jog_acc[name] = jog_acc.get(name, 0.0) + d
+                        now_t = time.time()
+                        if now_t - jog_tick_t.get(name, 0) > 0.3:
+                            jog_run_start[name] = now_t          # gap: new gesture
+                        jog_tick_t[name] = now_t
+                        playing = now_t - jog_run_start.get(name, now_t) > 1.5
+                        t_ = tune()
+                        if playing and t_.get('play_ignore', 1):
+                            jog_acc[name] = 0.0                 # motor/play: ignore
+                            continue
+                        NOTCH = t_.get('notch', 1)
+                        # anti-windup: never owe more than one step of history
+                        jog_acc[name] = max(-NOTCH*1.5, min(NOTCH*1.5, jog_acc[name]))
+                        n = int(jog_acc[name] / NOTCH)
+                        if n:
+                            jog_acc[name] -= n * NOTCH
+                            k = 'needle_' + head
+                            pos = state.get(k, 127)
+                            if n < 0 and pos <= 0:
+                                state['tape_off'] = state.get('tape_off', 0) + abs(n) * 15  # scrub tape back
+                            elif n > 0 and state.get('tape_off', 0) > 0:
+                                state['tape_off'] = max(0, state['tape_off'] - n * 15)      # unwind toward live
+                            else:
+                                state[k] = max(0, min(127, pos + n * 6))
+                            write_state()
+                            wheel(PANES[head], n)   # 3-line wheel notches: smooth
+                    continue
+                if mode == 'strip':
+                    head = name.split('_')[1]
+                    if head in PANES:
+                        state['needle_' + head] = m.value; write_state()
+                        auto_scrub[head] = 0
+                        if m.value >= 120:
+                            state['needle_' + head] = 127
+                            state['tape_off'] = 0
+                            tmux('send-keys', '-t', PANES[head], 'C-End')    # live
+                        elif m.value <= 6:
+                            state['needle_' + head] = 0
+                            tmux('send-keys', '-t', PANES[head], 'C-Home')   # top
+                        elif m.value >= 108:
+                            auto_scrub[head] = 1    # push past the edge: auto-scrub fwd
+                        elif m.value <= 19:
+                            auto_scrub[head] = -1   # auto-scrub back
+                        else:
+                            last = strip_last.get(name, m.value)
+                            strip_last[name] = m.value
+                            steps = (m.value - last) // 8
+                            for _ in range(min(6, abs(steps))):
+                                tmux('send-keys', '-t', PANES[head], 'NPage' if steps > 0 else 'PPage')
+                    continue
                 raw = m.value
                 lr = last_raw.get(name)
                 if lr is not None and abs(raw - lr) > 40:
-                    # big jump: require a second nearby event to confirm (real sweeps
-                    # send dense streams; Serato sync snaps send isolated extremes)
+                    # spurious-jump guard (Serato sync snaps): need 2nd nearby event
                     jc = jump_cand.get(name)
                     if jc is None or abs(raw - jc) > 25:
                         jump_cand[name] = raw
@@ -107,6 +257,28 @@ def main():
                     state[name] = v; moved = True
             if moved:
                 pending = time.time(); write_state()
+            _now = time.time()
+            PLAY_BEAT = 2.0                                     # seconds per 3-line step
+            for nm, until in list(play_until.items()):
+                if _now < until and _now - play_beat.get(nm, 0) >= PLAY_BEAT:
+                    play_beat[nm] = _now
+                    h = nm.split('_')[1]
+                    if h in PANES: wheel(PANES[h], play_dir.get(nm, 1))
+            if time.time() - scrub_t > 0.7:
+                scrub_t = time.time()
+                for h, d in list(auto_scrub.items()):
+                    if d and h in PANES:
+                        wheel(PANES[h], d * 2)   # readable auto-crawl: 6 lines per beat
+                        k = 'needle_' + h
+                        pos = state.get(k, 64)
+                        if d < 0 and pos <= 0:
+                            state['tape_off'] = state.get('tape_off', 0) + 45   # tape scrub back
+                        elif d > 0 and state.get('tape_off', 0) > 0:
+                            state['tape_off'] = max(0, state['tape_off'] - 45)
+                        else:
+                            state[k] = max(0, min(127, pos + d * 3))
+                            if state[k] == 127: auto_scrub[h] = 0
+                        write_state()
             if pending and time.time() - pending > SETTLE:
                 pending = None
                 send('opus', detent(state['opus'], OPUS_EFFORTS))
@@ -114,21 +286,7 @@ def main():
                 send('sonnet', detent(state['sonnet'], EFFORTS))
                 send('gpt', detent(state['gpt'], GPT_EFFORTS))
                 write_state()
-            now = time.time()
-            if now - hb_last > HB_PERIOD:
-                hb_last = now
-                x = state.get('crossfader', 64) / 127   # 0=left deck, 1=right deck
-                hb_phase += 1
-                left = (hb_phase % 4) / 4 >= x          # duty-cycle split
-                L = [h for h in ('opus','sonnet') if h in PANES] or ['opus']
-                R = [h for h in ('gpt','fable') if h in PANES] or ['fable']
-                head = L[hb_phase % len(L)] if left else R[hb_phase % len(R)]
-                tmux('send-keys', '-t', PANES[head], HB_MSG, 'Enter')
-                if head == 'gpt':
-                    time.sleep(0.8); tmux('send-keys', '-t', PANES['gpt'], 'Enter')
-                with open(HERE / 'slack.md', 'a') as f:
-                    f.write(f"[{time.strftime('%H:%M:%S')}] rig: ♥ heartbeat -> {head} (x={x:.2f})\n")
-            time.sleep(0.01)
+            time.sleep(1/240)
 
 if __name__ == '__main__':
     main()

@@ -12,20 +12,24 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 TUNE_FILE = pathlib.Path('/tmp/dragons-tuning.json')
 def tune():
     try: return json.loads(TUNE_FILE.read_text())
-    except Exception: return {"notch": 1, "play_ignore": 1}
+    except Exception: return {"notch": 1, "play_ignore": 0, "span_opus": 200, "span_fable": 800}
 
 TUNE_HTML = b'''<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <body style="background:#0d0d10;color:#ddd;font-family:ui-monospace,monospace;max-width:480px;margin:40px auto;padding:0 20px">
 <h2 style="color:#ffd75f">djclaude platter tuning</h2>
 <label>NOTCH (platter ticks per 3-line step): <b id=nv></b></label><br>
 <input id=n type=range min=1 max=400 style="width:100%%"><br><br>
-<label><input id=p type=checkbox> ignore motor/play rotation (scratch-only)</label>
+<label><input id=p type=checkbox> ignore motor/play rotation (scratch-only)</label><br><br>
+<label><span style="color:#ff5f5f">OPUS span</span> (pages): <b id=sov></b></label><br>
+<input id=so type=range min=20 max=3000 step=20 style="width:100%%"><br>
+<label><span style="color:#ffd75f">FABLE span</span> (pages): <b id=sfv></b></label><br>
+<input id=sf type=range min=20 max=3000 step=20 style="width:100%%"><br>
 <p id=st style="color:#666"></p>
 <script>
-const n=document.getElementById('n'),p=document.getElementById('p'),nv=document.getElementById('nv'),st=document.getElementById('st');
-fetch('/tune.json').then(r=>r.json()).then(t=>{n.value=t.notch;nv.textContent=t.notch;p.checked=!!t.play_ignore});
-function push(){nv.textContent=n.value;fetch('/set?notch='+n.value+'&play_ignore='+(p.checked?1:0)).then(()=>st.textContent='applied '+new Date().toLocaleTimeString())}
-n.oninput=push; p.onchange=push;
+const n=document.getElementById('n'),p=document.getElementById('p'),nv=document.getElementById('nv'),st=document.getElementById('st'),so=document.getElementById('so'),sf=document.getElementById('sf'),sov=document.getElementById('sov'),sfv=document.getElementById('sfv');
+fetch('/tune.json').then(r=>r.json()).then(t=>{n.value=t.notch;nv.textContent=t.notch;p.checked=!!t.play_ignore;so.value=t.span_opus||200;sov.textContent=so.value;sf.value=t.span_fable||800;sfv.textContent=sf.value});
+function push(){nv.textContent=n.value;sov.textContent=so.value;sfv.textContent=sf.value;fetch('/set?notch='+n.value+'&play_ignore='+(p.checked?1:0)+'&span_opus='+so.value+'&span_fable='+sf.value).then(()=>st.textContent='applied '+new Date().toLocaleTimeString())}
+n.oninput=push; p.onchange=push; so.oninput=push; sf.oninput=push;
 </script>'''
 
 class _EffortHTTP(BaseHTTPRequestHandler):
@@ -43,6 +47,8 @@ class _EffortHTTP(BaseHTTPRequestHandler):
             t = tune()
             if 'notch' in q: t['notch'] = max(1, min(400, int(q['notch'][0])))
             if 'play_ignore' in q: t['play_ignore'] = int(q['play_ignore'][0])
+            for k in ('span_opus','span_fable'):
+                if k in q: t[k] = max(20, min(3000, int(q[k][0])))
             TUNE_FILE.write_text(json.dumps(t))
             self.send_response(200); self.end_headers(); return
         return self._effort()
@@ -172,9 +178,11 @@ def main():
     jog_tick_t, jog_run_start = {}, {}
     jog_gest = {}
     play_dir, play_until, play_beat = {}, {}, {}
-    auto_scrub = {}; scrub_t = 0; strip_touch_t = {}; strip_pending = {}; strip_acc = {}; last_input_t = {}
+    auto_scrub = {}; scrub_t = 0; strip_touch_t = {}; strip_pending = {}; strip_acc = {}; strip_seen = {}; last_input_t = {}; pos_pages = {}; seek_target = {}; seek_t = 0
     q = collections.deque()
-    port = mido.open_input(CFG['port'], callback=q.append)
+    LAT = collections.deque(maxlen=100000)   # (proc latency seconds)
+    def _stamped(msg): q.append((time.perf_counter(), msg))
+    port = mido.open_input(CFG['port'], callback=_stamped)
     print(f"listening on {CFG['port']} (event-driven, 240Hz loop)", flush=True)
     write_state()
     last_evt = time.time(); reopen_t = 0
@@ -186,14 +194,15 @@ def main():
                 reopen_t = time.time()
                 try:
                     port.close()
-                    port = mido.open_input(CFG['port'], callback=q.append)
+                    port = mido.open_input(CFG['port'], callback=_stamped)
                     print(f"[{time.strftime('%H:%M:%S')}] reopened MIDI port", flush=True)
                 except Exception as e:
                     print(f"[{time.strftime('%H:%M:%S')}] reopen failed: {e}", flush=True)
             moved = False
             while q:
-                m = q.popleft()
+                _ts, m = q.popleft()
                 if m.type != 'control_change': continue
+                LAT.append(time.perf_counter() - _ts)
                 nc = ctl.get((m.channel, m.control))
                 if not nc: continue
                 name, inv = nc
@@ -270,35 +279,43 @@ def main():
                 del strip_pending[name]
                 head = name.split('_')[1]
                 if head not in PANES: continue
+                # touch/release transient guard: isolated extreme samples are noise;
+                # snap zones need two consecutive in-zone readings
+                prev_v, prev_t = strip_seen.get(name, (None, 0))
+                strip_seen[name] = (val, time.time())
+                zone = 'hi' if val >= 120 else ('lo' if val <= 6 else 'mid')
+                if zone != 'mid':
+                    pz = 'hi' if (prev_v or 64) >= 108 else ('lo' if (prev_v or 64) <= 19 else 'mid')
+                    if pz != zone or time.time() - prev_t > 0.25:
+                        continue                       # unconfirmed extreme: drop
+                elif prev_v is not None and abs(val - prev_v) > 60 and time.time() - prev_t > 0.2:
+                    strip_last[name] = val             # finger re-landed elsewhere: re-anchor,
+                    state['needle_' + head] = val      # no scroll burst
+                    write_state(); continue
                 auto_scrub[head] = 0
                 strip_touch_t[head] = time.time()
                 last_input_t[head] = time.time()
                 if val >= 120:
                     state['needle_' + head] = 127; state['tape_off'] = 0
+                    pos_pages[head] = tune().get('span_' + head, 400)
                     tmux('send-keys', '-t', PANES[head], 'C-End')
                 elif val <= 6:
                     state['needle_' + head] = 0
+                    pos_pages[head] = 0
                     tmux('send-keys', '-t', PANES[head], 'C-Home')
                 elif val >= 108:
                     state['needle_' + head] = val; auto_scrub[head] = 1
                 elif val <= 19:
                     state['needle_' + head] = val; auto_scrub[head] = -1
                 else:
-                    last = strip_last.get(name, val)
-                    acc = strip_acc.get(name, 0.0) + (val - last) / 2.0   # keep fractional motion
-                    strip_last[name] = val
-                    notches = int(acc)
-                    strip_acc[name] = acc - notches
-                    at_top = state.get('needle_' + head, 127) <= 0
-                    if notches < 0 and at_top:
-                        # cursor at the wall, still dragging left: scrub the tape back
-                        state['tape_off'] = min(3600, state.get('tape_off', 0) + abs(notches) * 20)
-                    elif notches > 0 and state.get('tape_off', 0) > 0:
-                        # dragging right with tape wound back: unwind toward live 1:1
-                        state['tape_off'] = max(0, state['tape_off'] - notches * 20)
-                    else:
-                        state['needle_' + head] = val
-                        if notches: wheel(PANES[head], notches)
+                    # ABSOLUTE seek: strip maps the whole transcript, 7..119 -> 0..100%
+                    span = tune().get('span_' + head, 400)
+                    frac = (val - 7) / 112.0
+                    target = int(frac * span)
+                    if pos_pages.get(head) is None:     # unknown: anchor via C-End first
+                        tmux('send-keys', '-t', PANES[head], 'C-End'); pos_pages[head] = span
+                    seek_target[head] = target          # pacer slews toward this
+                    state['needle_' + head] = val
                 write_state()
             if moved:
                 pending = time.time(); write_state()
@@ -309,6 +326,25 @@ def main():
                     play_beat[nm] = _now
                     h = nm.split('_')[1]
                     if h in PANES: wheel(PANES[h], play_dir.get(nm, 1))
+            if int(time.time()) % 5 == 0 and LAT and getattr(main, '_lat_t', 0) != int(time.time()):
+                main._lat_t = int(time.time())
+                sl = sorted(LAT)
+                def pct(p): return sl[min(len(sl)-1, int(len(sl)*p))] * 1000
+                pathlib.Path('/tmp/dragons-latency.json').write_text(json.dumps({
+                    'n': len(sl), 'p50_ms': round(pct(0.50), 3), 'p99_ms': round(pct(0.99), 3),
+                    'p9999_ms': round(pct(0.9999), 3), 'max_ms': round(sl[-1]*1000, 3)}))
+            if time.time() - seek_t > 0.025:
+                seek_t = time.time()
+                for h, tgt in list(seek_target.items()):
+                    cur = pos_pages.get(h)
+                    if cur is None or h not in PANES: seek_target.pop(h, None); continue
+                    d_ = tgt - cur
+                    if abs(d_) < 1: seek_target.pop(h, None); continue
+                    step = max(-3, min(3, d_))          # ≤3 pages per 25ms = 120 pages/s, steady
+                    n_ = int(step) if abs(step) >= 1 else (1 if step > 0 else -1)
+                    for _ in range(abs(n_)):
+                        tmux('send-keys', '-t', PANES[h], 'NPage' if n_ > 0 else 'PPage')
+                    pos_pages[h] = cur + n_
             _fnow = time.time()
             for h in list(last_input_t):
                 if _fnow - last_input_t[h] < 1.0:

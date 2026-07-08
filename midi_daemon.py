@@ -233,6 +233,7 @@ def main():
                                 g['dir'], g['run'], g['debt'] = dr, abs(d), 0
                             g['t'] = now_r
                         auto_scrub[name.split('_')[1]] = 0      # platter takes over
+                        seek_target.pop(name.split('_')[1], None)  # kill in-flight seek: scratch is tactile, not paced
                         last_input_t[name.split('_')[1]] = time.time()
                         jog_acc[name] = jog_acc.get(name, 0.0) + d
                         now_t = time.time()
@@ -340,7 +341,9 @@ def main():
                     if cur is None or h not in PANES: seek_target.pop(h, None); continue
                     d_ = tgt - cur
                     if abs(d_) < 1: seek_target.pop(h, None); continue
-                    step = max(-3, min(3, d_))          # ≤3 pages per 25ms = 120 pages/s, steady
+                    # adaptive rate: whole journey lands in ~1s (40 ticks), min 3 pg/tick
+                    cap = max(3, abs(d_) // 40 + 1)
+                    step = max(-cap, min(cap, d_))
                     n_ = int(step) if abs(step) >= 1 else (1 if step > 0 else -1)
                     for _ in range(abs(n_)):
                         tmux('send-keys', '-t', PANES[h], 'NPage' if n_ > 0 else 'PPage')

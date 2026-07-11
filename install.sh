@@ -7,6 +7,9 @@ command -v python3 >/dev/null || { echo "need python3"; exit 1; }
 cd "$(dirname "$0")"
 python3 -m venv .venv && ./.venv/bin/pip install -q mido python-rtmidi
 echo "→ deps installed"
+if [[ "$(uname -s)" == "Darwin" ]] && command -v xcrun >/dev/null; then
+  ./build-codex-scroll.sh
+fi
 echo "→ plug in your controller, then run the MIDI-learn to map YOUR faders:"
 echo "   ./.venv/bin/python learn2.py   # wiggle controls, edit mapping.json"
 echo "→ edit djclaude launcher: point head commands at your own claude/codex setups"

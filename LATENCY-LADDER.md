@@ -4,10 +4,11 @@
 | tmux send (fork+exec) | 4.19 ms | — | replaced |
 | tmux send (persistent -C pipe) | — | 0.5 µs | write+flush, measured n=200 |
 | python string overhead | — | 0.4 µs | = total Rust headroom; not worth a rewrite |
-| MIDI ingest | 10 ms poll | event callback | mido rtmidi cb -> deque |
-| daemon/dock loops | 100/30 Hz | 240 Hz | outruns both displays (175/240Hz) |
+| MIDI ingest | 10 ms poll | 2 kHz target direct poll | callback delivery regressed under Python 3.14/rtmidi; raw acquisition-to-receipt distribution is not yet established |
+| daemon/dock loops | 100/30 Hz | 2 kHz / 240 Hz | MIDI loop target / dock paint target |
+| stock Codex renderer | system HID / AX / DOM | CDP `mouseWheel` | pointer-safe visible motion accepted on build 26.707.31428; event→photon distribution not yet established |
 | tmux escape-time | 500 ms | 0 | Esc handled instantly |
-| remaining gates | | | tmux server cmd handling ~0.3ms · CC page repaint · Ghostty vsync (4.2/5.7ms frame) |
+| remaining gates | | | correlated raw MIDI → CDP ack → captured frame; reversal, long rewind, scan strip, reconnect, and cross-build replication |
 | unfixable | | | CC transcript scrolls page-wise; no line/pixel API |
 
 ## model-side, measured 2026-07-07 (single runs, 400-token generations)

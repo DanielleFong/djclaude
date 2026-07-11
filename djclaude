@@ -25,15 +25,23 @@ FRESH_LEVEL="${FRESH_LEVEL:-bare}"; OPUS_MODE="${OPUS_MODE:-fit}"
 
 MODE=full; RESTART=0; QUARTET=0
 [[ "$(basename "$0")" == "djfreshclaude" ]] && MODE=fresh
+RIG=""
+_prev=""
 for a in "$@"; do case "$a" in
   --fresh)   MODE=fresh ;;
   --restart) RESTART=1 ;;
   --quartet) QUARTET=1 ;;
-  *) echo "usage: $(basename "$0") [--fresh] [--restart] [--quartet]" >&2; exit 1 ;;
+  --rig)     _prev=rig ;;
+  *) if [[ "$_prev" == rig ]]; then RIG="$a"; _prev=""; else
+       echo "usage: $(basename "$0") [--fresh] [--restart] [--quartet] [--rig NAME]" >&2; exit 1; fi ;;
 esac; done
 
-if [[ "$RESTART" == 0 ]] && tmux has-session -t $S 2>/dev/null; then
+if [[ -z "$RIG" && "$RESTART" == 0 ]] && tmux has-session -t $S 2>/dev/null; then
   exec tmux attach -t $S
+fi
+# rigs attach-or-build their own session
+if [[ -n "$RIG" && "$RESTART" == 0 ]] && tmux has-session -t "dj-$RIG" 2>/dev/null; then
+  exec tmux attach -t "dj-$RIG"
 fi
 
 QO=" --append-system-prompt-file $HERE/ctx-opus.md"
@@ -63,6 +71,44 @@ if [[ "$EXP" -le "$(( $(date +%s) * 1000 ))" ]]; then
   "$CLAUDE" -p "ok" --model claude-sonnet-5 >/dev/null 2>&1 || echo "djclaude: refresh failed, sub heads may die" >&2
 fi
 : > "$HERE/slack.md"
+# --rig NAME: variable booth — heads defined by ~/.config/djclaude/rigs/NAME.sh
+if [[ -n "$RIG" ]]; then
+  RIGF="$HOME/.config/djclaude/rigs/$RIG.sh"
+  [[ -f "$RIGF" ]] || { echo "djclaude: no rig $RIGF"; exit 1; }
+  source "$RIGF"
+  S="dj-$RIG_TITLE"
+  if [[ -z "${LEFT_SCROLL_BACKEND:-}" ]]; then
+    if [[ "$LEFT_TYPE" == "codex" ]]; then
+      LEFT_SCROLL_BACKEND="codex_app"
+    else
+      LEFT_SCROLL_BACKEND="tmux"
+    fi
+  fi
+  if [[ -z "${RIGHT_SCROLL_BACKEND:-}" ]]; then
+    if [[ "$RIGHT_TYPE" == "codex" ]]; then
+      RIGHT_SCROLL_BACKEND="codex_app"
+    else
+      RIGHT_SCROLL_BACKEND="tmux"
+    fi
+  fi
+  if [[ "$LEFT_SCROLL_BACKEND" == "codex_app" || "$RIGHT_SCROLL_BACKEND" == "codex_app" ]]; then
+    "$HERE/build-codex-scroll.sh"
+  fi
+  tmux kill-session -t $S 2>/dev/null || true
+  tmux new-session -d -s $S -x 220 -y 60 "$(LEFT_CMD_BUILDER)"
+  tmux split-window -h -t $S:0.0 "$(RIGHT_CMD_BUILDER)"
+  tmux split-window -v -f -l 5 -t $S:0 "cd $HERE && ./.venv/bin/python timeline.py"
+  tmux set-option -t $S remain-on-exit on
+  printf '{"%s":{"pane":"%s:0.0","type":"%s","scroll":"%s","title":"%s"},"%s":{"pane":"%s:0.1","type":"%s","scroll":"%s","title":"%s"}}' \
+    "$LEFT_KEY" "$S" "$LEFT_TYPE" "$LEFT_SCROLL_BACKEND" "${LEFT_TITLE:-$LEFT_KEY}" \
+    "$RIGHT_KEY" "$S" "$RIGHT_TYPE" "$RIGHT_SCROLL_BACKEND" "${RIGHT_TITLE:-$RIGHT_KEY}" > /tmp/dragons-layout.json
+  pkill -f "$HERE/midi_daemon.py" 2>/dev/null || true
+  "$HERE/.venv/bin/python" "$HERE/midi_daemon.py" > "$HERE/daemon.log" 2>&1 &
+  echo $! > "$HERE/daemon.pid"
+  echo "rig '$RIG_TITLE' up (session $S)"
+  [[ -t 0 ]] && exec tmux attach -t $S
+  exit 0
+fi
 tmux kill-session -t $S 2>/dev/null || true
 tmux new-session -d -s $S -x 220 -y 60 "$OPUS_CMD"
 if [[ "$QUARTET" == 1 ]]; then
